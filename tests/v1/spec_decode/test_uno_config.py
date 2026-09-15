@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -9,6 +10,7 @@ import torch
 from vllm.config import (
     CacheConfig,
     DeviceConfig,
+    ECTransferConfig,
     LoRAConfig,
     ModelConfig,
     ParallelConfig,
@@ -34,6 +36,9 @@ def uno_config_factory():
     target.is_attention_free = False
     target.get_sliding_window.return_value = None
     target.get_vocab_size.return_value = 128
+    target.multimodal_config = None
+    target.hf_config = SimpleNamespace(eagle_aux_hidden_state_layer_ids=None)
+    target.compute_hash = lambda: "mock-target-hash"
     parallel = ParallelConfig(distributed_executor_backend="uni")
 
     def make(**overrides):
@@ -77,8 +82,11 @@ def test_uno_forces_probabilistic_draft_sampling(uno_config_factory):
         ({"uno_lora_path": " "}, "uno_lora_path"),
         ({"num_speculative_tokens": None}, "num_speculative_tokens"),
         ({"num_speculative_tokens": 0}, "greater than 0"),
-        ({"uno_mask_token_id": 1}, "greater than 1"),
+        ({"uno_mask_token_id": 0}, "greater than 0"),
+        ({"uno_mask_token_id": 1}, "noise requires"),
         ({"uno_mask_token_id": 129}, "target vocabulary size"),
+        ({"uno_noise_low": -1}, "greater than or equal to 0"),
+        ({"uno_noise_low": 8, "uno_mask_token_id": 8}, "noise requires"),
         ({"model": "other-model"}, "shares the target"),
         ({"target_model_config": None}, "target model"),
         ({"draft_tensor_parallel_size": 2}, "target's tensor_parallel_size"),
@@ -97,12 +105,11 @@ def test_uno_rejects_incompatible_options(uno_config_factory, overrides, message
 @pytest.mark.parametrize(
     ("attribute", "value", "message"),
     [
-        ("runner_type", "pooling", "text-only"),
-        ("is_diffusion", True, "text-only"),
-        ("is_multimodal_model", True, "text-only"),
-        ("is_encoder_decoder", True, "text-only"),
-        ("is_hybrid", True, "full attention"),
-        ("is_attention_free", True, "full attention"),
+        ("runner_type", "pooling", "text decoder"),
+        ("is_diffusion", True, "text decoder"),
+        ("is_encoder_decoder", True, "text decoder"),
+        ("is_hybrid", True, "hybrid"),
+        ("is_attention_free", True, "attention-free"),
     ],
 )
 def test_uno_rejects_unsupported_model_types(
@@ -112,6 +119,78 @@ def test_uno_rejects_unsupported_model_types(
     setattr(target, attribute, value)
     with pytest.raises(ValueError, match=message):
         uno_config_factory(target_model_config=target)
+
+
+def test_uno_refuses_a_multimodal_checkpoint_that_keeps_vision_inputs(
+    uno_config_factory,
+):
+    """An architecture-only relaxation would let images reach the draft rows."""
+    target = uno_config_factory().target_model_config
+    target.is_multimodal_model = True
+    target.multimodal_config = SimpleNamespace(language_model_only=False)
+    with pytest.raises(ValueError, match="language-only"):
+        uno_config_factory(target_model_config=target)
+
+    target.multimodal_config = SimpleNamespace(language_model_only=True)
+    config = uno_config_factory(target_model_config=target)
+    assert config.use_uno()
+
+
+def test_uno_refuses_a_multimodal_configuration_that_is_missing(uno_config_factory):
+    """A multimodal checkpoint without a multimodal config is not text-only."""
+    target = uno_config_factory().target_model_config
+    target.is_multimodal_model = True
+    target.multimodal_config = None
+    with pytest.raises(ValueError, match="language-only"):
+        uno_config_factory(target_model_config=target)
+
+
+def test_uno_refuses_missing_parallel_configuration(uno_config_factory):
+    with pytest.raises(ValueError, match="target model and parallel"):
+        uno_config_factory(target_parallel_config=None)
+
+
+def test_uno_refuses_language_only_with_embedding_inputs(uno_config_factory):
+    """``--enable-mm-embeds`` delivers embeddings that language-only forbids."""
+    target = uno_config_factory().target_model_config
+    target.is_multimodal_model = True
+    target.multimodal_config = SimpleNamespace(
+        language_model_only=True, enable_mm_embeds=True
+    )
+    with pytest.raises(ValueError, match="text-only"):
+        uno_config_factory(target_model_config=target)
+
+
+def test_uno_admits_language_only_without_embedding_inputs(uno_config_factory):
+    target = uno_config_factory().target_model_config
+    target.is_multimodal_model = True
+    target.multimodal_config = SimpleNamespace(
+        language_model_only=True, enable_mm_embeds=False
+    )
+    assert uno_config_factory(target_model_config=target).use_uno()
+
+
+def test_uno_admits_a_sliding_window_at_config_time(uno_config_factory):
+    """The window itself is admissible; the arrangement is checked at setup."""
+    target = uno_config_factory().target_model_config
+    target.get_sliding_window.return_value = 1024
+    config = uno_config_factory(target_model_config=target)
+    assert config.use_uno()
+
+
+def test_uno_noise_low_defaults_to_the_released_range(uno_config_factory):
+    config = uno_config_factory()
+    assert config.uno_noise_low == 1
+    assert config.uno_mask_token_id == 128
+
+    full_vocab = uno_config_factory(uno_noise_low=0, uno_mask_token_id=128)
+    assert full_vocab.uno_noise_low == 0
+
+
+def test_uno_noise_bounds_change_the_compilation_hash(uno_config_factory):
+    default = uno_config_factory()
+    full_vocab = uno_config_factory(uno_noise_low=0)
+    assert default.compute_hash() != full_vocab.compute_hash()
 
 
 @pytest.mark.parametrize(
@@ -158,14 +237,25 @@ def test_uno_accepts_tensor_parallelism(uno_config_factory):
         )
 
 
-def test_uno_rejects_sliding_window_attention(uno_config_factory):
+def test_uno_admits_sliding_window_attention_at_config_time(uno_config_factory):
+    """A window alone is not fatal: the draft-rows KV rule decides at setup.
+
+    The config-level guard cannot see the resolved attention backend or KV
+    cache groups, so it admits the model and the runner refuses a rolling
+    window allocation the draft rows could not own.
+    """
     target = uno_config_factory().target_model_config
     target.get_sliding_window.return_value = 64
-    with pytest.raises(ValueError, match="full attention"):
-        uno_config_factory(target_model_config=target)
+    config = uno_config_factory(target_model_config=target)
+    assert config.use_uno()
 
 
-def _make_vllm_uno_config(uno_config_factory, cache_config=None, **scheduler_overrides):
+def _make_vllm_uno_config(
+    uno_config_factory,
+    cache_config=None,
+    ec_transfer_config=None,
+    **scheduler_overrides,
+):
     scheduler_kwargs = dict(
         max_model_len=2048,
         max_num_seqs=4,
@@ -182,6 +272,8 @@ def _make_vllm_uno_config(uno_config_factory, cache_config=None, **scheduler_ove
     )
     if cache_config is not None:
         kwargs["cache_config"] = cache_config
+    if ec_transfer_config is not None:
+        kwargs["ec_transfer_config"] = ec_transfer_config
     return VllmConfig(**kwargs)
 
 
@@ -284,6 +376,27 @@ def test_uno_allows_default_kv_sharing_fast_prefill(uno_config_factory, monkeypa
         cache_config=CacheConfig(kv_sharing_fast_prefill=False),
     )
     assert config.cache_config.kv_sharing_fast_prefill is False
+
+
+def test_uno_rejects_ec_cache_transfer(uno_config_factory, monkeypatch):
+    """An EC consumer auto-enables embeddings, which Uno cannot serve."""
+    monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", True)
+    monkeypatch.setattr("vllm.config.vllm.envs.VLLM_USE_V2_MODEL_RUNNER", True)
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(
+        current_platform, "apply_config_platform_defaults", lambda _config: None
+    )
+    monkeypatch.setattr(
+        current_platform, "check_and_update_config", lambda _config: None
+    )
+    with pytest.raises(ValueError, match="EC cache transfer"):
+        _make_vllm_uno_config(
+            uno_config_factory,
+            ec_transfer_config=ECTransferConfig(
+                ec_connector="ECExampleConnector", ec_role="ec_consumer"
+            ),
+        )
 
 
 def test_uno_rejects_forced_v1_runner(uno_config_factory, monkeypatch):

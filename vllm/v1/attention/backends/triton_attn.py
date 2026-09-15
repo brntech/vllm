@@ -54,6 +54,49 @@ MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
 
 
+def _uno_static_query_width(
+    *,
+    use_uno: bool,
+    num_reqs: int,
+    num_actual_tokens: int,
+    max_query_len: int,
+    query_start_loc_cpu: torch.Tensor | None,
+    causal: bool | torch.Tensor,
+    uno_custom_mask: torch.Tensor | None,
+    mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None,
+    rswa_prefix_lens: torch.Tensor | None,
+) -> int | None:
+    """Return a validated C1 width for the opt-in Uno splitKV path.
+
+    This intentionally consumes the CPU copy of ``query_start_loc``.  The
+    result is static metadata selected before a CUDA graph is captured; the
+    attention kernel must never read a device QSL back to the host.
+    """
+    if not use_uno or num_reqs != 1:
+        return None
+    if max_query_len not in (2, 3, 4, 5):
+        return None
+    if num_actual_tokens != max_query_len or causal is not True:
+        return None
+    if (
+        uno_custom_mask is not None
+        or mm_req_doc_ranges is not None
+        or rswa_prefix_lens is not None
+    ):
+        return None
+    if query_start_loc_cpu is None:
+        return None
+    if query_start_loc_cpu.device.type != "cpu":
+        return None
+    if query_start_loc_cpu.ndim != 1 or query_start_loc_cpu.numel() != 2:
+        return None
+    if query_start_loc_cpu.dtype not in (torch.int32, torch.int64):
+        return None
+    if query_start_loc_cpu.tolist() != [0, max_query_len]:
+        return None
+    return max_query_len
+
+
 @dataclass
 class TritonAttentionMetadata:
     # NOTE(sang): Definition of context_len, query_len, and seq_len.
@@ -94,6 +137,8 @@ class TritonAttentionMetadata:
     mm_prefix_range_tensor: torch.Tensor | None = None
     rswa_prefix_lens: torch.Tensor | None = None
     rswa_window: int | None = None
+    # Host-validated physical Uno query width.  None keeps the stock path.
+    uno_static_query_width: int | None = None
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
@@ -113,6 +158,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         self.block_size = kv_cache_spec.block_size
 
         model_config = vllm_config.model_config
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        use_uno = getattr(speculative_config, "use_uno", None)
+        self._use_uno = bool(use_uno() if callable(use_uno) else use_uno)
         # Compatible with models with non-uniform per-layer head counts.
         self.num_heads_q = get_num_attention_heads_from_layers(
             vllm_config, layer_names
@@ -208,6 +256,20 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
 
+        uno_static_query_width = _uno_static_query_width(
+            use_uno=self._use_uno,
+            num_reqs=num_reqs,
+            num_actual_tokens=num_actual_tokens,
+            max_query_len=max_query_len,
+            query_start_loc_cpu=getattr(
+                common_attn_metadata, "query_start_loc_cpu", None
+            ),
+            causal=common_attn_metadata.causal,
+            uno_custom_mask=getattr(common_attn_metadata, "uno_custom_mask", None),
+            mm_req_doc_ranges=getattr(common_attn_metadata, "mm_req_doc_ranges", None),
+            rswa_prefix_lens=getattr(common_attn_metadata, "rswa_prefix_lens", None),
+        )
+
         use_cascade = common_prefix_len > 0
 
         if use_cascade:
@@ -245,6 +307,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_output=self.softmax_segm_output,
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
+            uno_static_query_width=uno_static_query_width,
         )
 
         mm_ranges = common_attn_metadata.mm_req_doc_ranges
@@ -681,6 +744,7 @@ class TritonAttentionImpl(AttentionImpl):
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,
             rswa_prefix_lens=attn_metadata.rswa_prefix_lens,
+            uno_static_query_width=attn_metadata.uno_static_query_width,
             rswa_window=attn_metadata.rswa_window,
             kv_quant_mode=self._kv_quant_mode,
             k_scale_cache=k_scale_cache,

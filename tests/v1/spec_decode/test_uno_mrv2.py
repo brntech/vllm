@@ -72,6 +72,7 @@ def test_rejection_and_prefill_use_correct_seed_and_persistent_slot():
         4,
         16,
         42,
+        1,
         1000,
         1,
     )
@@ -122,6 +123,7 @@ def test_draft_does_not_write_null_or_unallocated_or_out_of_context_slots(
         4,
         max_len,
         42,
+        1,
         1000,
         1,
     )
@@ -195,7 +197,7 @@ def test_graph_replay_refreshes_native_backend_without_rebuilding_metadata(
     proposer.num_eager_proposals = 0
     proposer.max_model_len = 32
     proposer.speculative_config = SimpleNamespace(
-        uno_mask_token_id=1000, uno_noise_seed=42
+        uno_mask_token_id=1000, uno_noise_low=1, uno_noise_seed=42
     )
     proposer.input_buffers = InputBuffers(4, 8, torch.device("cpu"))
     proposer.sample_idx_mapping = torch.empty(8, dtype=torch.int32)
@@ -223,7 +225,7 @@ def test_graph_replay_refreshes_native_backend_without_rebuilding_metadata(
         ("replay", None)
     )
     proposer._copy_request_inputs = Mock()
-    proposer._build_draft_attn_metadata = Mock(return_value={"eager": object()})
+    proposer._build_uniform_attn_metadata = Mock(return_value={"eager": object()})
     proposer._generate_draft = Mock()
     proposer.set_lora_hook(lambda mapping: events.append(("lora", mapping)))
     fused_prepare = Mock()
@@ -243,14 +245,14 @@ def test_graph_replay_refreshes_native_backend_without_rebuilding_metadata(
     assert events[-1] == ("lora", None)
     if full_graph:
         assert events[1:3] == [("refresh", captured_attn), ("replay", None)]
-        proposer._build_draft_attn_metadata.assert_not_called()
+        proposer._build_uniform_attn_metadata.assert_not_called()
         slot_builder.assert_not_called()
         proposer._generate_draft.assert_not_called()
         assert proposer.num_graph_replays == 1
     else:
         group.update_draft_decode_metadata.assert_not_called()
         proposer.cudagraph_manager.run_fullgraph.assert_not_called()
-        proposer._build_draft_attn_metadata.assert_called_once()
+        proposer._build_uniform_attn_metadata.assert_called_once()
         slot_builder.assert_called_once()
         proposer._generate_draft.assert_called_once()
         assert proposer.draft_max_seq_len == 32
@@ -279,7 +281,7 @@ def test_eager_draft_attn_metadata_keeps_k_row_physical_capacity(monkeypatch):
     proposer.num_eager_proposals = 0
     proposer.max_model_len = 64
     proposer.speculative_config = SimpleNamespace(
-        uno_mask_token_id=1000, uno_noise_seed=42
+        uno_mask_token_id=1000, uno_noise_low=1, uno_noise_seed=42
     )
     proposer.input_buffers = InputBuffers(4, 32, torch.device("cpu"))
     proposer.sample_idx_mapping = torch.empty(32, dtype=torch.int32)
@@ -298,23 +300,23 @@ def test_eager_draft_attn_metadata_keeps_k_row_physical_capacity(monkeypatch):
     captured: dict = {}
 
     def fake_build(
+        batch_desc,
         num_reqs,
-        num_reqs_padded,
-        num_tokens_padded,
+        num_query_per_req,
         seq_lens_cpu_upper_bound,
         step,
         **kwargs,
     ):
         captured.update(
+            batch_desc=batch_desc,
             num_reqs=num_reqs,
-            num_reqs_padded=num_reqs_padded,
-            num_tokens_padded=num_tokens_padded,
+            num_query_per_req=num_query_per_req,
             step=step,
             **kwargs,
         )
         return {"eager": object()}
 
-    proposer._build_draft_attn_metadata = fake_build
+    proposer._build_uniform_attn_metadata = fake_build
     proposer.set_lora_hook(lambda mapping: None)
     monkeypatch.setattr(f"{module}.prepare_uno_inputs_fused", Mock())
     monkeypatch.setattr(f"{module}.build_slot_mappings_by_layer", Mock(return_value={}))
@@ -327,10 +329,38 @@ def test_eager_draft_attn_metadata_keeps_k_row_physical_capacity(monkeypatch):
     proposer.propose(
         batch, {}, {}, tensor, None, tensor, tensor, tensor, tensor, tensor, tensor
     )
-    assert captured["num_tokens_padded"] == count
-    assert captured["num_reqs_padded"] == n
+    assert captured["batch_desc"] is desc
+    assert captured["num_reqs"] == n
     assert captured["step"] == k
     assert captured["num_query_per_req"] == k
+
+
+def test_every_uno_metadata_helper_call_resolves_on_the_proposer():
+    """Eager drafting must resolve every metadata builder it calls.
+
+    The eager branch once called a helper that the shared speculator base class
+    no longer defined, so a batch without a captured draft graph failed on its
+    first proposal instead of drafting eagerly. A rename in the base class must
+    not silently break the call site again.
+    """
+    import ast
+    import inspect
+    from pathlib import Path
+
+    from vllm.v1.worker.gpu.spec_decode import uno as uno_module
+
+    source = Path(inspect.getfile(uno_module)).read_text(encoding="utf-8")
+    referenced = {
+        node.attr
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+        and node.attr.startswith("_build_")
+    }
+    assert referenced
+    missing = sorted(name for name in referenced if not hasattr(UnoSpeculator, name))
+    assert missing == []
 
 
 def _cpu_uno_proposer(
@@ -385,7 +415,7 @@ def _cpu_uno_proposer(
     proposer.max_num_reqs = max_num_seqs
     proposer.max_model_len = 64
     proposer.speculative_config = SimpleNamespace(
-        uno_mask_token_id=1000, uno_noise_seed=42
+        uno_mask_token_id=1000, uno_noise_low=1, uno_noise_seed=42
     )
     rows = max(32, max_num_seqs * k)
     proposer.input_buffers = InputBuffers(max_num_seqs, rows, torch.device("cpu"))
@@ -398,7 +428,7 @@ def _cpu_uno_proposer(
     )
     proposer.kv_cache_config = Mock()
     proposer._copy_request_inputs = Mock()
-    proposer._build_draft_attn_metadata = Mock(return_value={"eager": object()})
+    proposer._build_uniform_attn_metadata = Mock(return_value={"eager": object()})
     proposer._generate_draft = Mock()
     proposer.set_lora_hook(lambda mapping: None)
     proposer.attn_groups = [[Mock()]]
@@ -553,6 +583,72 @@ def test_draft_dispatch_falls_back_above_the_largest_captured_size(monkeypatch):
     assert manager.dispatch(12, 12 * k, k, 2).cg_mode == CUDAGraphMode.NONE
 
 
+def test_draft_dispatch_receipt_covers_a_padded_serving_key(monkeypatch, caplog):
+    """A padded serving key must appear in the receipt, not only the row counts.
+
+    Captured graphs at 4, 8 and 16 draft rows serve a three-request batch at
+    K=4 (12 rows) by padding into the 16-row graph. The receipt used to list
+    only descriptor row counts, so it omitted the (12, 2) key that dispatch
+    already resolved by padding. The receipt and the dispatch both call the
+    same resolution now, so the key (12, 2) is advertised and covered.
+    """
+    import logging
+
+    from vllm.config.compilation import CUDAGraphMode
+
+    _cpu_graph_manager_patches(monkeypatch)
+    proposer = _cpu_uno_proposer(
+        4,
+        max_num_seqs=4,
+        capture_sizes=[1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16],
+    )
+    proposer.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY)
+    manager = proposer.cudagraph_manager
+    assert manager is not None
+    manager._graphs_captured = True
+
+    assert (12, 2) in manager.captured_dispatch_keys()
+    assert (16, 2) in manager.captured_dispatch_keys()
+    assert manager.key_is_covered(3, 12, 4, 2)
+    assert manager.dispatch(3, 12, 4, 2).num_tokens == 16
+
+    with caplog.at_level(logging.INFO, logger="vllm.v1.worker.gpu.spec_decode.uno"):
+        proposer._log_draft_graph_coverage()
+    assert "cover every request count" in caplog.text
+    assert "num_tokens=12 effective_loras=2" in caplog.text
+
+
+def test_draft_graph_receipt_before_capture_names_nothing_captured(monkeypatch, caplog):
+    """Before capture the receipt must not advertise a key it cannot serve.
+
+    ``captured_dispatch_keys`` is populated from the configured capture sizes at
+    construction, so a receipt rendered before ``capture()`` completed could
+    advertise keys while dispatch (which also requires ``_graphs_captured``)
+    refuses them. The pre-capture state is an empty advertised list and a named
+    set of uncovered keys, not a silent return.
+    """
+    import logging
+
+    from vllm.config.compilation import CUDAGraphMode
+
+    _cpu_graph_manager_patches(monkeypatch)
+    proposer = _cpu_uno_proposer(4, max_num_seqs=2, capture_sizes=[16])
+    proposer.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY)
+    manager = proposer.cudagraph_manager
+    assert manager is not None
+    assert not manager._graphs_captured
+
+    assert manager.captured_dispatch_keys() == []
+    assert not manager.key_is_covered(1, 4, 4, 2)
+    assert manager.dispatch(1, 4, 4, 2).cg_mode == CUDAGraphMode.NONE
+
+    with caplog.at_level(logging.INFO, logger="vllm.v1.worker.gpu.spec_decode.uno"):
+        proposer._log_draft_graph_coverage()
+    assert "nothing captured" in caplog.text
+    assert "num_tokens=4 effective_loras=2" in caplog.text
+    assert "num_tokens=8 effective_loras=2" in caplog.text
+
+
 def test_uncovered_request_counts_are_the_top_of_the_range():
     """Padding means the gap can only be at the top, never a hole inside."""
     from vllm.v1.worker.gpu.spec_decode.uno import uncovered_draft_request_counts
@@ -590,6 +686,7 @@ def test_startup_coverage_is_logged_for_both_outcomes(monkeypatch, caplog):
     assert manager is not None
     for desc in manager._capture_descs[CUDAGraphMode.FULL]:
         manager.graphs[desc] = Mock()
+    manager._graphs_captured = True
     with caplog.at_level(logging.INFO, logger="vllm.v1.worker.gpu.spec_decode.uno"):
         covered._log_draft_graph_coverage()
     assert "cover every request count" in caplog.text
@@ -602,6 +699,7 @@ def test_startup_coverage_is_logged_for_both_outcomes(monkeypatch, caplog):
     assert manager is not None
     for desc in manager._capture_descs[CUDAGraphMode.FULL]:
         manager.graphs[desc] = Mock()
+    manager._graphs_captured = True
     with caplog.at_level(logging.INFO, logger="vllm.v1.worker.gpu.spec_decode.uno"):
         gapped._log_draft_graph_coverage()
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -856,7 +954,7 @@ def test_uno_warmup_shares_filter_keys_without_prefill_verification(
         num_sm=82,
         use_flashinfer=use_flashinfer,
     )
-    covered = set()
+    covered: set[str] = set()
     observed_modes = set()
     for call in plan.sampler_warmups:
         if call.sampler_branch == "native_verification":
@@ -915,7 +1013,7 @@ def test_uno_warmup_filter_calls_add_uncovered_keys_across_sampler_branches(
         num_sm=82,
         use_flashinfer=False,
     )
-    covered = set()
+    covered: set[str] = set()
     observed_modes = set()
     for call in plan.sampler_warmups:
         if not call.kernel_keys:
@@ -1268,6 +1366,7 @@ def test_uno_warmup_executes_native_verification_s4(
     class LaunchRecorder:
         def __init__(self, name):
             self.name = name
+            self.arg_names: tuple[str, ...] = ()
 
         def __getitem__(self, grid):
             def launch(*args, **kwargs):
@@ -1778,27 +1877,22 @@ def test_uno_mode_branch_matches_production_sampler(
     )
     subject.apply_sampling_params = lambda logits, *_args, **_kwargs: logits
     calls: list[str] = []
-    monkeypatch.setattr(
-        sampler_module,
-        "flashinfer_sample",
-        lambda logits, _top_k, _top_p: (
-            calls.append("flashinfer")
-            or torch.zeros(logits.shape[0], dtype=torch.int64)
-        ),
-    )
-    monkeypatch.setattr(
-        sampler_module,
-        "apply_top_k_top_p",
-        lambda logits, _top_k, _top_p: calls.append("triton_filter") or logits,
-    )
-    monkeypatch.setattr(
-        sampler_module,
-        "gumbel_sample",
-        lambda logits, *_args, **_kwargs: (
-            calls.append("triton_sample")
-            or torch.zeros(logits.shape[0], dtype=torch.int64)
-        ),
-    )
+
+    def record_flashinfer(logits, _top_k, _top_p):
+        calls.append("flashinfer")
+        return torch.zeros(logits.shape[0], dtype=torch.int64)
+
+    def record_filter(logits, _top_k, _top_p):
+        calls.append("triton_filter")
+        return logits
+
+    def record_gumbel(logits, *_args, **_kwargs):
+        calls.append("triton_sample")
+        return torch.zeros(logits.shape[0], dtype=torch.int64)
+
+    monkeypatch.setattr(sampler_module, "flashinfer_sample", record_flashinfer)
+    monkeypatch.setattr(sampler_module, "apply_top_k_top_p", record_filter)
+    monkeypatch.setattr(sampler_module, "gumbel_sample", record_gumbel)
 
     subject.sample(
         torch.ones((len(params), 4)),
@@ -1862,6 +1956,7 @@ def test_uno_warmup_key_set_covers_served_prepare_and_sampler_shapes():
             block_size=16,
             max_model_len=4096,
             noise_seed=0,
+            noise_low=1,
             noise_high=vocab - 267,
             has_rejected=True,
             block=256,
@@ -2292,7 +2387,7 @@ def test_uno_startup_jit_self_check_proves_flashinfer_branches(monkeypatch):
     )
     monkeypatch.setattr(jit_monitor, "_active", True)
     monkeypatch.setattr(warmup.torch.accelerator, "synchronize", lambda: None)
-    observed_launches = {}
+    observed_launches: dict[str, int] = {}
 
     @contextmanager
     def recorded_sampler_launches():
@@ -2543,7 +2638,12 @@ def _uno_sample_tokens_runner(monkeypatch, num_reqs=1):
 
     def propose(*args, **kwargs):
         assert args[3] is target_hidden
-        assert kwargs == {"dp_sync": None, "mm_inputs": None}
+        assert kwargs == {
+            "dp_sync": None,
+            "mm_inputs": None,
+            "dummy_run": False,
+            "is_profile": False,
+        }
         events.append(f"propose-step-{proposer._step}")
         proposer._step += 1
         return torch.tensor([[8, 9]], dtype=torch.int64).repeat(num_reqs, 1)
@@ -3630,3 +3730,352 @@ def test_survivor_usage_percentages_are_read_against_the_pinned_pool():
         1 - 1 / 68, 5
     )
     assert round(budget.usage_with_free_blocks(81, 1), 5) == round(1 - 1 / 80, 5)
+
+
+def test_draft_graph_coverage_names_the_dispatch_key_it_lacks(monkeypatch, caplog):
+    """The startup receipt must state the key dispatch looks up.
+
+    Capturing draft row counts [4, 8, 16] is not the same as covering the
+    (num_tokens, effective_loras) key a four-request batch dispatches with:
+    the receipt listed the counts and so omitted the padded key dispatch
+    resolves, while the refusal names that key. The receipt and the refusal
+    must name the same key.
+    """
+    import logging
+
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+    from vllm.v1.worker.gpu.spec_decode.uno_draft_moe import (
+        refuse_uncaptured_eager_draft,
+    )
+
+    _cpu_graph_manager_patches(monkeypatch)
+    proposer = _cpu_uno_proposer(
+        4, max_num_seqs=4, capture_sizes=[1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16]
+    )
+    proposer.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY)
+    manager = proposer.cudagraph_manager
+    assert manager is not None
+    manager._graphs_captured = True
+    assert (16, 2) in manager.captured_dispatch_keys()
+    # The capture at 16 rows pads down to serve the dispatch keys 9..16. Drop
+    # that whole family of keys: a bundle of captured row counts is not the
+    # same receipt as the keys dispatch is asked for.
+    for padded in range(9, 17):
+        manager._candidates.pop((padded, 2), None)
+
+    with caplog.at_level(logging.WARNING, logger="vllm.v1.worker.gpu.spec_decode.uno"):
+        proposer._log_draft_graph_coverage()
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, caplog.text
+    message = warnings[0].getMessage()
+    _, _, keys = message.partition("captured draft dispatch keys ")
+    covered_text, _, uncovered_text = keys.partition("; ")
+    assert uncovered_text, message
+    assert "num_tokens=16" not in covered_text
+    assert "num_tokens=16 effective_loras=2" in uncovered_text
+
+    proposer.draft_moe_state = SimpleNamespace(
+        top_k=4, variant="gemma4-sm86-marlin-topk4"
+    )
+    desc = BatchExecutionDescriptor(CUDAGraphMode.NONE, 16, 4, num_active_loras=2)
+    with pytest.raises(Exception) as excinfo:
+        refuse_uncaptured_eager_draft(proposer, desc, warmup=False)
+    assert "num_tokens=16 effective_loras=2" in str(excinfo.value)
+
+
+def test_proposal_call_site_forwards_the_runners_pass_state():
+    """The production proposal call site must pass the runner's own flags.
+
+    ``_dummy_run`` classified its proposals, but the only other proposal call
+    site passed neither flag, so a speculator could not tell a discarded
+    startup proposal from a serving one. A test double that supplies the flag
+    itself would hide that, so this drives the real GPUModelRunner method.
+    """
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    recorded: dict = {}
+
+    class RecordingSpeculator:
+        def prepare_watermarking(self, *args, **kwargs):
+            raise AssertionError("a non-watermark sampler must not be prepared")
+
+        def propose(self, *args, **kwargs):
+            recorded.update(kwargs)
+            return torch.zeros((2, 4), dtype=torch.int64)
+
+    runner = object.__new__(GPUModelRunner)
+    runner._draft_workspace_lane = 0
+    runner.speculator = RecordingSpeculator()
+    runner.sampler = SimpleNamespace(
+        sampling_states=SimpleNamespace(
+            temperature=SimpleNamespace(gpu=torch.zeros(2)),
+            seeds=SimpleNamespace(gpu=torch.zeros(2)),
+        )
+    )
+    runner.adaptive_verification = None
+    runner.req_states = SimpleNamespace(
+        last_sampled_tokens=torch.zeros(2, dtype=torch.int64),
+        next_prefill_tokens=torch.zeros(2, dtype=torch.int64),
+        draft_tokens=torch.zeros((2, 4), dtype=torch.int64),
+    )
+    tensor = torch.zeros(2)
+
+    runner._run_speculator_proposal(
+        SimpleNamespace(idx_mapping=torch.tensor([0, 1])),
+        None,
+        None,
+        tensor,
+        None,
+        tensor,
+        tensor,
+        None,
+        None,
+        dummy_run=True,
+        is_profile=False,
+    )
+    assert recorded["dummy_run"] is True
+    assert recorded["is_profile"] is False
+
+
+def _startup_forward_markers() -> dict[str, str]:
+    """Which callable each startup phase hands the worker's forward, unparsed."""
+    import ast
+    import textwrap
+
+    from vllm.v1.worker import gpu_worker
+
+    source = textwrap.dedent(
+        inspect.getsource(gpu_worker.Worker.compile_or_warm_up_model)
+    )
+    markers: dict[str, str] = {}
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call) or len(node.args) < 2:
+            continue
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if name in ("warmup_kernels", "run_uno_served_jit_self_check"):
+            markers[name] = ast.unparse(node.args[1])
+    return markers
+
+
+def _cpu_worker_forward(runner, *, use_v2: bool):
+    """A real Worker whose forward reaches `runner` without a device."""
+    from vllm.v1.worker import gpu_worker
+
+    worker = object.__new__(gpu_worker.Worker)
+    worker.model_runner = runner
+    worker.use_v2_model_runner = use_v2
+    worker._pp_send_work = []
+    worker.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            pass_config=SimpleNamespace(enable_sp=False)
+        ),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+    )
+    worker.annotate_profile = lambda scheduler_output: nullcontext()
+    return worker
+
+
+def _mixed_warmup_model_runner(proposer, recorded: list[bool]):
+    """A runner double that runs the real proposal with the flags it is sent."""
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        max_num_reqs=2,
+        vllm_config=SimpleNamespace(num_lookahead_tokens=0),
+        max_model_len=64,
+        model_state=SimpleNamespace(max_encoder_len=0),
+        kv_connector=SimpleNamespace(set_disabled=lambda disabled: None),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=1000,
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))
+            ],
+        ),
+    )
+
+    def execute_model(scheduler_output, intermediate_tensors=None, *, is_profile=False):
+        recorded.append(is_profile)
+        n = len(scheduler_output.num_scheduled_tokens)
+        if n == 0:
+            return None
+        proposer.propose(
+            SimpleNamespace(
+                num_reqs=n,
+                idx_mapping=torch.arange(n),
+                seq_lens_cpu_upper_bound=torch.full((max(4, n),), 8, dtype=torch.int32),
+            ),
+            attn_metadata={},
+            slot_mappings={},
+            last_hidden_states=torch.zeros(1),
+            aux_hidden_states=None,
+            num_sampled=torch.zeros(n, dtype=torch.int32),
+            num_rejected=torch.zeros(n, dtype=torch.int32),
+            last_sampled=torch.zeros(n, dtype=torch.int64),
+            next_prefill_tokens=torch.zeros(n, dtype=torch.int64),
+            temperature=torch.zeros(n),
+            seeds=torch.zeros(n, dtype=torch.int64),
+            dummy_run=False,
+            is_profile=is_profile,
+        )
+        return None
+
+    runner.execute_model = execute_model
+    return runner
+
+
+def test_startup_forwards_are_marked_as_discarded():
+    """Every startup phase handing batches to the worker marks them discarded.
+
+    ``warmup_kernels`` runs before capture and the JIT self-check runs after
+    it; both feed scheduler-realistic batches through the worker, so their
+    proposal call sites see ``dummy_run=False``. Without the profiling mark a
+    speculator that refuses uncaptured serving shapes kills the engine at boot.
+    The mark, not a shape guess, is what keeps that exemption honest.
+    """
+    from vllm.v1.worker.gpu.model_runner import ExecuteModelState
+
+    assert "dummy_run" in ExecuteModelState._fields
+    assert "is_profile" in ExecuteModelState._fields
+
+    markers = _startup_forward_markers()
+    assert set(markers) == {"warmup_kernels", "run_uno_served_jit_self_check"}
+    assert markers["warmup_kernels"] == "self._discarded_startup_forward()"
+    assert (
+        markers["run_uno_served_jit_self_check"] == "self._discarded_startup_forward()"
+    )
+
+
+def test_discarded_startup_forward_marks_the_pass_for_the_runner():
+    """The marker callable carries ``is_profile`` to the runner it wraps."""
+    from vllm.v1.worker import gpu_worker
+
+    seen: dict = {}
+
+    def fake_execute_model(scheduler_output, *, is_profile=False):
+        seen["is_profile"] = is_profile
+        return None
+
+    worker = object.__new__(gpu_worker.Worker)
+    worker.execute_model = fake_execute_model
+    worker._discarded_startup_forward()(SimpleNamespace())
+    assert seen == {"is_profile": True}
+
+
+def test_worker_forward_keeps_the_v2_profile_flag_off_the_v1_runner(monkeypatch):
+    """The shared forward must not send ``is_profile`` to the V1 runner.
+
+    ``gpu_worker.execute_model`` forwards to both runner versions, but the V1
+    runner's ``execute_model`` has no ``is_profile`` parameter, so an ordinary
+    V1 request would raise ``TypeError`` before executing. The double below has
+    the V1 signature exactly, which is what a permissive Mock cannot catch.
+    """
+    from vllm.v1.worker import gpu_worker
+
+    monkeypatch.setattr(
+        gpu_worker,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+
+    v1_calls: list[dict] = []
+
+    class V1Runner:
+        is_pooling_model = False
+
+        def execute_model(self, scheduler_output, intermediate_tensors=None):
+            v1_calls.append({"intermediate_tensors": intermediate_tensors})
+            return None
+
+    worker = _cpu_worker_forward(V1Runner(), use_v2=False)
+    assert worker.execute_model(SimpleNamespace(total_num_scheduled_tokens=0)) is None
+    assert v1_calls == [{"intermediate_tensors": None}]
+
+    v2_calls: list[bool] = []
+
+    class V2Runner:
+        is_pooling_model = False
+
+        def execute_model(
+            self, scheduler_output, intermediate_tensors=None, *, is_profile=False
+        ):
+            v2_calls.append(is_profile)
+            return None
+
+    worker = _cpu_worker_forward(V2Runner(), use_v2=True)
+    worker._discarded_startup_forward()(SimpleNamespace(total_num_scheduled_tokens=0))
+    worker.execute_model(SimpleNamespace(total_num_scheduled_tokens=0))
+    assert v2_calls == [True, False]
+
+
+def test_mixed_warmup_through_the_worker_never_reaches_the_serving_refusal(
+    monkeypatch,
+):
+    """Startup batches must not be refused as uncaptured serving shapes.
+
+    With the draft top-k variant enabled and no captured graph, the mixed
+    warmup the startup JIT self-check runs reaches the eager branch of
+    ``propose`` with both flags false unless the worker marks the forward as a
+    discarded pass. The marked forward must complete, and the same uncaptured
+    shape on an unmarked serving forward must still refuse by name.
+    """
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker import gpu_worker
+    from vllm.v1.worker.gpu import warmup
+    from vllm.v1.worker.gpu.spec_decode import uno_draft_moe
+    from vllm.v1.worker.gpu.spec_decode.uno_draft_moe import (
+        DraftMoEConfigurationError,
+    )
+
+    _cpu_graph_manager_patches(monkeypatch)
+    monkeypatch.setattr(
+        gpu_worker,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.spec_decode.uno.prepare_uno_inputs_fused",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.spec_decode.uno.build_slot_mappings_by_layer",
+        lambda *args, **kwargs: {},
+    )
+    # The variant is requested but capture produced no graph: the boot shape
+    # the JIT self-check must survive.
+    monkeypatch.setattr(uno_draft_moe, "uno_draft_moe_enabled", lambda: True)
+
+    proposer = _cpu_uno_proposer(4, max_num_seqs=2, capture_sizes=[8, 16])
+    proposer.init_cudagraph_manager(CUDAGraphMode.FULL_DECODE_ONLY)
+    manager = proposer.cudagraph_manager
+    assert manager is not None
+    assert not manager._graphs_captured
+
+    marked: list[bool] = []
+    marked_runner = _mixed_warmup_model_runner(proposer, marked)
+    worker = _cpu_worker_forward(marked_runner, use_v2=True)
+    ran = warmup.run_mixed_prefill_decode_warmup(
+        marked_runner,
+        worker._discarded_startup_forward(),
+        lambda grammar_output=None: None,
+        5,
+    )
+    assert ran
+    # The two executed batches are marked. The trailing empty cleanup is sent
+    # is_profile=True by the same callable too; it schedules no tokens, so it
+    # reaches no proposal.
+    assert marked == [True, True, True]
+
+    serving: list[bool] = []
+    serving_runner = _mixed_warmup_model_runner(proposer, serving)
+    serving_worker = _cpu_worker_forward(serving_runner, use_v2=True)
+    with pytest.raises(DraftMoEConfigurationError) as excinfo:
+        warmup.run_mixed_prefill_decode_warmup(
+            serving_runner,
+            serving_worker.execute_model,
+            lambda grammar_output=None: None,
+            5,
+        )
+    assert "num_tokens=4" in str(excinfo.value)
+    assert "effective_loras=2" in str(excinfo.value)
+    assert serving[:1] == [False]

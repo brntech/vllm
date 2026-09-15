@@ -466,9 +466,14 @@ class SpeculativeConfig:
     uno_lora_path: str | None = None
     """Uno adapter directory in PEFT format, or its Hugging Face repository ID.
     The adapter is active only on the noisy draft rows."""
-    uno_mask_token_id: int | None = Field(default=None, gt=1)
-    """Exclusive upper bound of Uno's uniform noise range [1, mask_token_id).
-    Defaults to the target vocabulary size. Match the adapter's training range."""
+    uno_noise_low: int = Field(default=1, ge=0, strict=True)
+    """Inclusive lower bound of Uno's uniform noise range. The released
+    convention starts at 1; checkpoints trained over the full vocabulary
+    (e.g. Gemma) start at 0."""
+    uno_mask_token_id: int | None = Field(default=None, gt=0, strict=True)
+    """Exclusive upper bound of the noise range
+    [uno_noise_low, mask_token_id). Defaults to the target vocabulary size.
+    Match the adapter's training range."""
     uno_noise_seed: int = 0
     """Seed for Uno's deterministic draft-noise generator."""
 
@@ -649,6 +654,13 @@ class SpeculativeConfig:
                     "index_share_for_mtp_iteration",
                     False,
                 )
+            )
+
+        if self.method == "uno":
+            # The noise range changes every drafted token id, so cached graphs
+            # and compiled kernels must not be shared across two ranges.
+            factors.append(
+                ("uno_noise_bounds", self.uno_noise_low, self.uno_mask_token_id)
             )
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
@@ -1667,22 +1679,60 @@ class SpeculativeConfig:
         if (
             model_config.runner_type != "generate"
             or model_config.is_diffusion
-            or model_config.is_multimodal_model
             or model_config.is_encoder_decoder
         ):
-            raise ValueError("Uno requires a text-only decoder model")
-        if (
-            model_config.is_hybrid
-            or model_config.is_attention_free
-            or model_config.get_sliding_window() is not None
-        ):
-            raise ValueError("Uno requires a model with full attention in every layer")
+            raise ValueError("Uno requires a text decoder model")
+        if model_config.is_multimodal_model:
+            if not self._target_is_language_only():
+                raise ValueError(
+                    "Uno requires a language-only model; a multimodal checkpoint "
+                    "is accepted only when it is served with "
+                    "--language-model-only, so no vision input can reach the "
+                    "draft rows"
+                )
+            if (
+                getattr(model_config.multimodal_config, "enable_mm_embeds", False)
+                is True
+            ):
+                raise ValueError(
+                    "Uno requires a text-only target; --enable-mm-embeds would "
+                    "deliver multimodal embeddings to the draft rows even with "
+                    "--language-model-only"
+                )
+        if model_config.is_hybrid or model_config.is_attention_free:
+            raise ValueError(
+                "Uno requires attention layers with a shared KV cache; hybrid "
+                "and attention-free models are not supported"
+            )
+        # A sliding window is admissible only when the KV allocation is full and
+        # every layer's window is enforced by the attention backend the draft
+        # rows use (see the draft-rows KV rule at setup). This predicate cannot
+        # see the resolved backend or KV groups, so it admits the model here and
+        # the runtime refuses an arrangement the draft cannot honor.
 
         vocab_size = model_config.get_vocab_size()
         if self.uno_mask_token_id is None:
             self.uno_mask_token_id = vocab_size
-        if not 1 < self.uno_mask_token_id <= vocab_size:
-            raise ValueError("uno_mask_token_id must be in (1, target vocabulary size]")
+        if not 0 <= self.uno_noise_low < self.uno_mask_token_id <= vocab_size:
+            raise ValueError(
+                "Uno noise requires 0 <= uno_noise_low < uno_mask_token_id "
+                "<= target vocabulary size"
+            )
+
+    def _target_is_language_only(self) -> bool:
+        """Whether a multimodal checkpoint was loaded with text inputs only.
+
+        ``--language-model-only`` keeps ``multimodal_config`` (so
+        ``is_multimodal_model`` stays true) but zeroes every modality limit, so
+        the engine can never deliver an image or video to the draft rows.
+        Pre-computed embeddings bypass those limits when ``enable_mm_embeds`` is
+        set, so they are refused separately.
+        """
+        multimodal_config = self.target_model_config.multimodal_config
+        return (
+            multimodal_config is not None
+            and multimodal_config.language_model_only is True
+        )
 
     @staticmethod
     def _maybe_override_draft_max_model_len(

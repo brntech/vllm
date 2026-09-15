@@ -19,7 +19,11 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    is_full_attention_spec,
+    iter_layer_specs,
+)
 from vllm.v1.spec_decode.uno_noise import fill_uno_noise
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -32,6 +36,11 @@ from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.uno_draft_moe import (
+    DraftMoECaptureState,
+    draft_moe_capture_scope,
+    refuse_uncaptured_eager_draft,
+)
 from vllm.v1.worker.gpu.spec_decode.uno_prepare import prepare_uno_inputs_fused
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -57,6 +66,7 @@ def prepare_uno_inputs_reference(
     k: int,
     max_model_len: int,
     noise_seed: int,
+    noise_low: int,
     noise_high: int,
     step: int,
 ) -> None:
@@ -80,7 +90,9 @@ def prepare_uno_inputs_reference(
     buffers.input_ids[:count].copy_(seed_tokens.repeat_interleave(k))
     is_noise = (offsets != 0).repeat(n)
     req_seeds = (seeds[state_idx] + noise_seed).repeat_interleave(k)
-    fill_uno_noise(buffers.input_ids[:count], is_noise, req_seeds, step, 1, noise_high)
+    fill_uno_noise(
+        buffers.input_ids[:count], is_noise, req_seeds, step, noise_low, noise_high
+    )
     # Keep unused, out-of-context rows in range for the model. Their KV writes
     # are suppressed below; native verification bounds usable candidates.
     buffers.positions[:count].copy_(positions.clamp(max=max_model_len - 1).flatten())
@@ -131,6 +143,13 @@ def uncovered_draft_request_counts(
         return []
     largest = max(captured_token_counts, default=0)
     return [n for n in range(1, max_num_reqs + 1) if n * k > largest]
+
+
+def _format_dispatch_keys(keys: Sequence[tuple[int, int]]) -> str:
+    """Name draft dispatch keys in the form the refusal names them."""
+    return ", ".join(
+        f"num_tokens={num_tokens} effective_loras={loras}" for num_tokens, loras in keys
+    )
 
 
 def draft_warmup_request_counts(max_num_reqs: int) -> list[int]:
@@ -590,6 +609,9 @@ class UnoSpeculator(DraftModelSpeculator):
         )
         self.cudagraph_manager: CudaGraphManager | None = None
         self._graph_attn_metadata: dict[BatchExecutionDescriptor, dict[str, Any]] = {}
+        # Set by capture(); the draft top-k variant is active only for graphs
+        # captured under it, and an uncaptured serving shape is refused.
+        self.draft_moe_state: DraftMoECaptureState | None = None
         self._step = 0
         self.num_graph_replays = 0
         self.num_eager_proposals = 0
@@ -632,8 +654,19 @@ class UnoSpeculator(DraftModelSpeculator):
         if not self.draft_attn_layer_names:
             raise ValueError("Uno requires shared target attention with a KV cache")
         for name in self.draft_attn_layer_names:
-            if layers[name].get_attn_backend().get_name() != "FLASH_ATTN":
-                raise ValueError("Uno currently requires the FLASH_ATTN backend")
+            layer = layers[name]
+            backend = layer.get_attn_backend().get_name()
+            if backend not in ("FLASH_ATTN", "TRITON_ATTN"):
+                raise ValueError(
+                    "Uno requires FLASH_ATTN or TRITON_ATTN on every draft "
+                    f"layer; {name} uses {backend}"
+                )
+            # Admissible sliding windows are the ones the layer's own attention
+            # kernel bounds: each admitted backend reads the layer's window and
+            # masks keys per query, and the KV rule in set_attn keeps the
+            # allocation full so no window-owned row can be recycled under a
+            # draft write. A model whose layers reach any other backend is
+            # refused above rather than drafted with an unbounded window.
         self.supports_mm_inputs = False
 
     def set_attn(
@@ -646,14 +679,24 @@ class UnoSpeculator(DraftModelSpeculator):
     ) -> None:
         groups = kv_cache_config.kv_cache_groups
         if len(groups) != 1:
-            raise ValueError("Uno requires one homogeneous full-attention KV group")
+            raise ValueError(
+                "Uno requires one KV cache group covering every draft layer"
+            )
         spec = groups[0].kv_cache_spec
+        layer_specs = tuple(iter_layer_specs(spec))
         if (
-            type(spec) is not FullAttentionSpec
-            or spec.sliding_window is not None
-            or spec.attention_chunk_size is not None
+            not is_full_attention_spec(spec)
+            or getattr(spec, "sliding_window", None) is not None
+            or any(
+                getattr(layer_spec, "attention_chunk_size", None) is not None
+                or getattr(layer_spec, "non_causal", False)
+                for layer_spec in layer_specs
+            )
         ):
-            raise ValueError("Uno requires homogeneous full attention")
+            raise ValueError(
+                "Uno requires a causal full KV allocation shared by the draft "
+                "rows; a rolling-window or chunked allocation is not supported"
+            )
         super().set_attn(
             model_state,
             kv_cache_config,
@@ -670,6 +713,16 @@ class UnoSpeculator(DraftModelSpeculator):
                 "Uno requires attention metadata builders supporting "
                 "native draft decode updates"
             )
+
+    def _draft_dispatch_lora_case(self) -> int:
+        """The effective LoRA case draft graphs are captured and dispatched under.
+
+        The draft always runs with the adapter active, so capture and serving
+        dispatch must agree on one case. Deriving it separately at each site let
+        the dispatch key and the startup coverage receipt drift apart, which is
+        what made a coverage line name a shape the next request was refused for.
+        """
+        return 2 if self.k > 1 else 0
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         self._graph_attn_metadata.clear()
@@ -688,7 +741,7 @@ class UnoSpeculator(DraftModelSpeculator):
             self.device,
             CUDAGraphMode.FULL_DECODE_ONLY if can_capture else CUDAGraphMode.NONE,
             decode_query_len=self.k,
-            lora_capture_cases=[2 if self.k > 1 else 0],
+            lora_capture_cases=[self._draft_dispatch_lora_case()],
         )
 
     def capture(self) -> None:
@@ -719,13 +772,17 @@ class UnoSpeculator(DraftModelSpeculator):
                 desc.num_reqs, desc.num_tokens, attn_metadata, slots
             )
 
-        try:
-            self.cudagraph_manager.capture(
-                create_forward_fn, "Capturing Uno CUDA graphs"
-            )
-        finally:
-            if self._lora_hook is not None:
-                self._lora_hook(None)
+        with draft_moe_capture_scope(self) as draft_moe:
+            self.draft_moe_state = draft_moe
+            if draft_moe is not None:
+                draft_moe.log_capture_receipt(logger)
+            try:
+                self.cudagraph_manager.capture(
+                    create_forward_fn, "Capturing Uno CUDA graphs"
+                )
+            finally:
+                if self._lora_hook is not None:
+                    self._lora_hook(None)
         self._log_draft_graph_coverage()
 
     def draft_warmup_token_counts(self) -> list[int]:
@@ -781,24 +838,33 @@ class UnoSpeculator(DraftModelSpeculator):
         )
 
     def _log_draft_graph_coverage(self) -> None:
-        """Say once, at startup, which request counts have a draft graph.
+        """Say once, at startup, which draft dispatch keys have a graph.
 
         Drafting eagerly costs far more per step than replaying a graph, and
         the fallback is chosen per step with no other announcement: the
         one-time eager line can only fire once, and it says nothing about the
-        rest of the range. A deployment that will draft eagerly at its own
-        concurrency should learn that at startup rather than from its latency.
+        rest of the range. Dispatch looks up an exact
+        ``(num_tokens, effective_loras)`` key, so this receipt states that
+        same key; a receipt of bare row counts can name a count as captured
+        while a dispatch for it still finds no graph.
         """
         assert self.cudagraph_manager is not None
-        captured = sorted({desc.num_tokens for desc in self.cudagraph_manager.graphs})
-        uncovered = uncovered_draft_request_counts(captured, self.k, self.max_num_reqs)
+        manager = self.cudagraph_manager
+        draft_loras = self._draft_dispatch_lora_case()
+        captured = manager.captured_dispatch_keys()
+        uncovered = [
+            manager.dispatch_key(n * self.k, draft_loras)
+            for n in range(1, self.max_num_reqs + 1)
+            if not manager.key_is_covered(n, n * self.k, self.k, draft_loras)
+        ]
         if not captured:
             logger.info(
-                "Uno draft CUDA graphs: none captured, so every proposal "
-                "drafts eagerly. A draft graph needs a cudagraph_capture_sizes "
-                "entry of at least %d (num_speculative_tokens), and the "
-                "largest usable entry is bounded by max_num_seqs * "
-                "num_speculative_tokens = %d.",
+                "Uno draft CUDA graphs: nothing captured, so every proposal "
+                "drafts eagerly. Uncovered draft dispatch keys: %s. A draft "
+                "graph needs a cudagraph_capture_sizes entry of at least %d "
+                "(num_speculative_tokens), and the largest usable entry is "
+                "bounded by max_num_seqs * num_speculative_tokens = %d.",
+                _format_dispatch_keys(uncovered),
                 self.k,
                 self.max_num_reqs * self.k,
             )
@@ -806,27 +872,23 @@ class UnoSpeculator(DraftModelSpeculator):
         if uncovered:
             logger.warning(
                 "Uno draft CUDA graphs cover %d of %d request counts: "
-                "captured draft row counts %s serve up to %d concurrent "
-                "requests, and %d..%d will draft eagerly because %d rows "
-                "exceed the largest captured count %d. Add a "
-                "cudagraph_capture_sizes entry at or above max_num_seqs * "
-                "num_speculative_tokens = %d, or lower max_num_seqs.",
-                uncovered[0] - 1,
+                "captured draft dispatch keys %s; %s will draft eagerly "
+                "because no captured graph serves that (num_tokens, "
+                "effective_loras) key. Add a cudagraph_capture_sizes entry "
+                "at or above max_num_seqs * num_speculative_tokens = %d, or "
+                "lower max_num_seqs.",
+                self.max_num_reqs - len(uncovered),
                 self.max_num_reqs,
-                captured,
-                uncovered[0] - 1,
-                uncovered[0],
-                uncovered[-1],
-                self.max_num_reqs * self.k,
-                captured[-1],
+                _format_dispatch_keys(captured),
+                _format_dispatch_keys(uncovered),
                 self.max_num_reqs * self.k,
             )
             return
         logger.info(
             "Uno draft CUDA graphs cover every request count: captured draft "
-            "row counts %s serve all %d concurrent requests at "
+            "dispatch keys %s serve all %d concurrent requests at "
             "num_speculative_tokens=%d.",
-            captured,
+            _format_dispatch_keys(captured),
             self.max_num_reqs,
             self.k,
         )
@@ -912,6 +974,7 @@ class UnoSpeculator(DraftModelSpeculator):
             self.k,
             self.max_model_len,
             self.speculative_config.uno_noise_seed,
+            self.speculative_config.uno_noise_low,
             self.speculative_config.uno_mask_token_id,
             self._step,
         )
@@ -919,7 +982,9 @@ class UnoSpeculator(DraftModelSpeculator):
             self.block_tables.slot_mappings.fill_(PAD_SLOT_ID)
             self.sample_idx_mapping.fill_(-1)
         assert self.cudagraph_manager is not None
-        desc = self.cudagraph_manager.dispatch(n, count, self.k, 2 if self.k > 1 else 0)
+        desc = self.cudagraph_manager.dispatch(
+            n, count, self.k, self._draft_dispatch_lora_case()
+        )
         if is_profile:
             desc = BatchExecutionDescriptor(CUDAGraphMode.NONE, count, n)
         with self._draft_lora(n, desc.num_tokens):
@@ -940,17 +1005,19 @@ class UnoSpeculator(DraftModelSpeculator):
                     if self.num_graph_replays == 1:
                         logger.info("Uno draft CUDA graph replay is active.")
             else:
+                refuse_uncaptured_eager_draft(
+                    self, desc, warmup=dummy_run or is_profile
+                )
                 self.draft_max_seq_len = min(
                     int(input_batch.seq_lens_cpu_upper_bound[:n].max()) + self.k,
                     self.max_model_len,
                 )
-                draft_attn = self._build_draft_attn_metadata(
+                draft_attn = self._build_uniform_attn_metadata(
+                    desc,
                     n,
-                    desc.num_reqs or n,
-                    desc.num_tokens,
+                    self.k,
                     input_batch.seq_lens_cpu_upper_bound,
                     step=self.k,
-                    num_query_per_req=self.k,
                 )
                 slots = build_slot_mappings_by_layer(
                     self.block_tables.slot_mappings[:, : desc.num_tokens],

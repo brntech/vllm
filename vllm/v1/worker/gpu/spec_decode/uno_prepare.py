@@ -38,7 +38,7 @@ _LAUNCH_KEY_DEBUG_ENABLED = _launch_key_debug_enabled()
 if _LAUNCH_KEY_DEBUG_ENABLED:
     from vllm.v1.worker.gpu.launch_key_debug import record_triton_launch
 else:
-    record_triton_launch = None
+    record_triton_launch = None  # type: ignore[assignment]
 
 
 # Keep this contract shared with the CPU launch-key test.  These arguments
@@ -307,6 +307,7 @@ def _prepare_uno_specialization_kwargs(
     block_size: int,
     max_model_len: int,
     noise_seed: int,
+    noise_low: int,
     noise_high: int,
     has_rejected: bool,
     block: int,
@@ -333,7 +334,7 @@ def _prepare_uno_specialization_kwargs(
         "BLOCK_SIZE": block_size,
         "MAX_MODEL_LEN": max_model_len,
         "NOISE_SEED": noise_seed,
-        "NOISE_LOW": 1,
+        "NOISE_LOW": noise_low,
         "NOISE_HIGH": noise_high,
         "HAS_REJECTED": has_rejected,
         "PAD_ID": PAD_SLOT_ID,
@@ -357,6 +358,7 @@ def prepare_uno_launch_key(
     block_size: int,
     max_model_len: int,
     noise_seed: int,
+    noise_low: int,
     noise_high: int,
     has_rejected: bool,
     block: int,
@@ -392,6 +394,7 @@ def prepare_uno_launch_key(
                 block_size=block_size,
                 max_model_len=max_model_len,
                 noise_seed=noise_seed,
+                noise_low=noise_low,
                 noise_high=noise_high,
                 has_rejected=has_rejected,
                 block=block,
@@ -415,6 +418,7 @@ def prepare_uno_inputs_fused(
     k: int,
     max_model_len: int,
     noise_seed: int,
+    noise_low: int,
     noise_high: int,
     step: int,
 ) -> None:
@@ -457,7 +461,7 @@ def prepare_uno_inputs_fused(
         raise ValueError(
             "Uno preparation requires positive K, block size, and max length"
         )
-    if noise_high <= 1:
+    if not 0 <= noise_low < noise_high:
         raise ValueError("Uno noise range must include at least one token")
 
     num_reqs = int(input_batch.num_reqs)
@@ -516,6 +520,7 @@ def prepare_uno_inputs_fused(
             block_size=int(block_size),
             max_model_len=int(max_model_len),
             noise_seed=int(noise_seed),
+            noise_low=int(noise_low),
             noise_high=int(noise_high),
             has_rejected=num_rejected is not None,
             block=block,

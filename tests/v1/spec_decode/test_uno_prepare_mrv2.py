@@ -168,6 +168,7 @@ def _run_reference(case, k: int, step: int):
         k,
         case.max_model_len,
         29,
+        1,
         100_003,
         step,
     )
@@ -199,6 +200,7 @@ def test_fused_uno_inputs_match_eager_reference(k, scenario):
         k,
         gpu.max_model_len,
         29,
+        1,
         100_003,
         step,
     )
@@ -229,6 +231,7 @@ def test_fused_uno_boundaries_write_padding_slots(k):
         k,
         case.max_model_len,
         29,
+        1,
         100_003,
         37,
     )
@@ -271,6 +274,7 @@ def test_fused_uno_covers_large_graph_padding_capacity():
         4,
         case.max_model_len,
         29,
+        1,
         100_003,
         37,
     )
@@ -301,6 +305,7 @@ def test_fused_uno_preserves_large_runtime_step_arithmetic():
         4,
         case.max_model_len,
         29,
+        1,
         100_003,
         step,
     )
@@ -327,6 +332,7 @@ def test_fused_uno_rejects_cpu_buffers_before_launch():
             4,
             case.max_model_len,
             29,
+            1,
             100_003,
             37,
         )
@@ -364,12 +370,10 @@ def test_uno_prepare_specialization_ignores_dynamic_target_view_lengths(
     # pointer alignment and storage offset.
     warmup_num_sampled = torch.empty(num_reqs, dtype=torch.int32, device=device)
     warmup_num_rejected = torch.empty(num_reqs, dtype=torch.int32, device=device)
-    served_num_sampled = torch.empty(num_reqs + 1, dtype=torch.int32, device=device)[
+    served_num_sampled = torch.empty(num_reqs + 1, dtype=torch.int32, device=device)[1:]
+    served_num_rejected = torch.empty(num_reqs + 1, dtype=torch.int32, device=device)[
         1:
     ]
-    served_num_rejected = torch.empty(
-        num_reqs + 1, dtype=torch.int32, device=device
-    )[1:]
     assert warmup_num_sampled.storage_offset() == 0
     assert served_num_sampled.storage_offset() == 1
 
@@ -380,6 +384,7 @@ def test_uno_prepare_specialization_ignores_dynamic_target_view_lengths(
         block_size=16,
         max_model_len=4096,
         noise_seed=0,
+        noise_low=1,
         noise_high=151_669,
         has_rejected=True,
         block=256,
@@ -410,9 +415,8 @@ def test_uno_prepare_specialization_ignores_dynamic_target_view_lengths(
     assert "TARGET_POSITION_CAP" not in dict(warmup_specialization)
     import vllm.v1.worker.gpu.spec_decode.uno_prepare as uno_prepare
 
-    assert 'do_not_specialize_on_alignment=["num_sampled_ptr", "num_rejected_ptr"]' in inspect.getsource(
-        uno_prepare
-    )
+    alignment = 'do_not_specialize_on_alignment=["num_sampled_ptr", "num_rejected_ptr"]'
+    assert alignment in inspect.getsource(uno_prepare)
 
 
 def test_fused_uno_rejects_non_native_last_sampled_layout_on_cpu():
@@ -434,6 +438,7 @@ def test_fused_uno_rejects_non_native_last_sampled_layout_on_cpu():
             4,
             case.max_model_len,
             29,
+            1,
             100_003,
             37,
         )
@@ -458,6 +463,7 @@ def test_fused_uno_rejects_non_native_next_prefill_layout_on_cpu():
             4,
             case.max_model_len,
             29,
+            1,
             100_003,
             37,
         )

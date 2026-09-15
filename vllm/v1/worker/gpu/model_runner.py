@@ -1253,8 +1253,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_rejected: torch.Tensor,
         dp_sync: DPSyncState | None,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+        dummy_run: bool = False,
+        is_profile: bool = False,
     ) -> None:
-        """Run one proposal and retain its device-resident draft tokens."""
+        """Run one proposal and retain its device-resident draft tokens.
+
+        ``dummy_run`` and ``is_profile`` carry this pass's own state from
+        ``execute_model`` so a speculator sees the same classification on this
+        call site as on ``_dummy_run``'s. A proposer that discards the result
+        (warmup, profiling) must not be mistaken for a serving shape.
+        """
         assert self.speculator is not None
         assert self.sampler is not None
         if isinstance(self.sampler, GPUWatermarkSampler):
@@ -1276,6 +1284,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.temperature.gpu,
                 self.sampler.sampling_states.seeds.gpu,
                 dp_sync=dp_sync,
+                dummy_run=dummy_run,
+                is_profile=is_profile,
                 mm_inputs=mm_inputs,
             )
         self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
@@ -2319,6 +2329,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             skip_speculator_proposal=scheduler_output.skip_speculator_proposal,
             zero_next_draft_req_ids=frozenset(scheduler_output.zero_next_draft_req_ids),
             uno_step_trace=uno_step_trace,
+            dummy_run=dummy_run,
+            is_profile=is_profile,
         )
 
         if not self.is_last_pp_rank:
@@ -2356,6 +2368,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_speculator_proposal = self.execute_model_state.skip_speculator_proposal
         zero_next_draft_req_ids = self.execute_model_state.zero_next_draft_req_ids
         uno_step_trace = self.execute_model_state.uno_step_trace
+        dummy_run = self.execute_model_state.dummy_run
+        is_profile = self.execute_model_state.is_profile
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2519,6 +2533,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_rejected,
                 dp_sync,
                 mm_inputs,
+                dummy_run=dummy_run,
+                is_profile=is_profile,
             )
             if uno_step_trace is not None:
                 uno_step_trace.end_stage("propose")
@@ -2693,6 +2709,11 @@ class ExecuteModelState(NamedTuple):
     skip_speculator_proposal: bool = False
     zero_next_draft_req_ids: frozenset[str] = frozenset()
     uno_step_trace: UnoStepTimingTrace | None = None
+    # This pass's own classification, kept between execute_model and
+    # sample_tokens so the proposal call site classifies itself exactly as
+    # _dummy_run and profile runs do.
+    dummy_run: bool = False
+    is_profile: bool = False
 
 
 class BatchReqState(NamedTuple):

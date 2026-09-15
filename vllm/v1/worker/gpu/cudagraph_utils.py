@@ -493,6 +493,80 @@ class CudaGraphManager:
             {desc.num_tokens for desc in self.graphs if desc.num_active_loras == 0}
         )
 
+    def dispatch_key(self, num_tokens: int, num_active_loras: int) -> tuple[int, int]:
+        """The ``(num_tokens, effective_loras)`` key dispatch looks up."""
+        return (num_tokens, self._resolve_effective_loras(num_active_loras))
+
+    def captured_dispatch_keys(self) -> list[tuple[int, int]]:
+        """The ``(num_tokens, effective_loras)`` keys dispatch resolves a graph for.
+
+        Enumerated from the same padded candidate key space ``dispatch`` looks
+        up, and empty until capture completes, so a receipt cannot advertise a
+        descriptor row count that only pads up to another graph or a key from an
+        unpopulated table.
+        """
+        if not self._graphs_captured:
+            return []
+        return sorted(key for key in self._candidates if key[0] > 0)
+
+    def resolve_dispatch(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        num_active_loras: int,
+        max_query_len: int | None = None,
+        num_ubatches: int = 1,
+    ) -> BatchExecutionDescriptor | None:
+        """The descriptor dispatch resolves for this batch, or ``None``.
+
+        One resolution shared by ``dispatch``, ``key_is_covered`` and the
+        startup coverage receipt, so the key a receipt advertises is the key
+        dispatch consults and the captured-state condition cannot be applied at
+        one site only.
+        """
+        if not self._graphs_captured or num_tokens <= 0:
+            return None
+        effective_loras = self._resolve_effective_loras(num_active_loras)
+        key = (num_tokens, effective_loras)
+        for desc in self._candidates.get(key, ()):
+            if _is_compatible(
+                desc,
+                num_reqs,
+                num_tokens,
+                uniform_token_count,
+                effective_loras,
+                max_query_len,
+                num_ubatches,
+            ):
+                return desc
+        return None
+
+    def key_is_covered(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        num_active_loras: int,
+        max_query_len: int | None = None,
+        num_ubatches: int = 1,
+    ) -> bool:
+        """Whether dispatch resolves a graph for this batch's key.
+
+        Mirrors ``dispatch`` exactly, including the captured-state condition.
+        """
+        return (
+            self.resolve_dispatch(
+                num_reqs,
+                num_tokens,
+                uniform_token_count,
+                num_active_loras,
+                max_query_len,
+                num_ubatches,
+            )
+            is not None
+        )
+
     def dispatch(
         self,
         num_reqs: int,
@@ -503,26 +577,21 @@ class CudaGraphManager:
         num_ubatches: int = 1,
     ) -> BatchExecutionDescriptor:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
-
-        effective_loras = self._resolve_effective_loras(num_active_loras)
-        key = (num_tokens, effective_loras)
-        if self._graphs_captured and num_tokens > 0 and key in self._candidates:
-            for desc in self._candidates[key]:
-                if _is_compatible(
-                    desc,
-                    num_reqs,
-                    num_tokens,
-                    uniform_token_count,
-                    effective_loras,
-                    max_query_len,
-                    num_ubatches,
-                ):
-                    return desc
+        desc = self.resolve_dispatch(
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            num_active_loras,
+            max_query_len,
+            num_ubatches,
+        )
+        if desc is not None:
+            return desc
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
-            num_active_loras=effective_loras,
+            num_active_loras=self._resolve_effective_loras(num_active_loras),
             num_ubatches=num_ubatches,
         )
 

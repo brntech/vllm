@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
+from functools import partial
 from types import NoneType
 from typing import TYPE_CHECKING, Any, cast
 
@@ -809,7 +810,15 @@ class Worker(WorkerBase):
 
         if self.use_v2_model_runner:
             # A workspace resize after capture frees what the graphs point at.
-            warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+            # The startup warmup forwards are discarded; mark them as a
+            # profiling pass so a proposal made before capture is not mistaken
+            # for a serving shape by a speculator that must refuse uncaptured
+            # serving shapes.
+            warmup_kernels(
+                self.model_runner,
+                self._discarded_startup_forward(),
+                self.sample_tokens,
+            )
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
@@ -937,7 +946,9 @@ class Worker(WorkerBase):
         # Run the Uno-only startup assertion while the monitor is armed but
         # before launch-key receipts begin labeling customer work as served.
         run_uno_served_jit_self_check(
-            self.model_runner, self.execute_model, self.sample_tokens
+            self.model_runner,
+            self._discarded_startup_forward(),
+            self.sample_tokens,
         )
         mark_launch_key_serving_ready()
 
@@ -958,6 +969,22 @@ class Worker(WorkerBase):
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
+
+    def _discarded_startup_forward(
+        self,
+    ) -> Callable[
+        ["SchedulerOutput"], ModelRunnerOutput | AsyncModelRunnerOutput | None
+    ]:
+        """A startup forward whose proposal result is discarded.
+
+        ``warmup_kernels`` and the startup JIT self-check feed
+        scheduler-realistic batches through ``execute_model``, so their
+        proposals reach the speculator as ordinary forwards. Marking them with
+        ``is_profile`` -- the flag the runner already uses for its own discarded
+        passes -- keeps a speculator that must refuse uncaptured serving shapes
+        from mistaking a startup batch for a request.
+        """
+        return partial(self.execute_model, is_profile=True)
 
     def _get_cudagraph_capture_context(self) -> AbstractContextManager[None]:
         """Let the configured profiler observe CUDA graph capture."""
@@ -1154,7 +1181,7 @@ class Worker(WorkerBase):
     @torch.inference_mode()
     @with_gpu_sync_check
     def execute_model(
-        self, scheduler_output: "SchedulerOutput"
+        self, scheduler_output: "SchedulerOutput", *, is_profile: bool = False
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # Wait for the previous step's sends so this forward pass cannot
         # overwrite buffers they are still reading.
@@ -1213,9 +1240,13 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
+        # `is_profile` classifies a pass for the V2 runner; the V1 runner's
+        # execute_model takes no such keyword. Send it only where it is
+        # accepted, which leaves the V1 path byte-identical.
+        pass_state = {"is_profile": is_profile} if self.use_v2_model_runner else {}
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
+                scheduler_output, intermediate_tensors, **pass_state
             )
             if (
                 self.use_v2_model_runner

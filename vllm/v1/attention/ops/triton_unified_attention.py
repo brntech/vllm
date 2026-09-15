@@ -7,6 +7,7 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+import os
 from typing import Any
 
 import torch
@@ -33,6 +34,148 @@ from vllm.v1.kv_cache_interface import KVQuantMode
 logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
+
+
+NUM_PAR_SOFTMAX_SEGMENTS = 16
+
+
+def _uno_splitkv_env_enabled() -> bool:
+    """Return the explicit opt-in for Gemma Uno's small-query splitKV path."""
+    return os.environ.get("UNO_GEMMA_SPLITKV", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _uno_gemma_splitkv_admissible(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    max_seqlen_q: int,
+    num_seqs: int,
+    causal: bool | torch.Tensor,
+    window_size: tuple[int, int],
+    uno_static_query_width: int | None,
+    seq_threshold_3D: int | None,
+    num_par_softmax_segments: int | None,
+    softmax_segm_output: torch.Tensor | None,
+    softmax_segm_max: torch.Tensor | None,
+    softmax_segm_expsum: torch.Tensor | None,
+    mm_prefix_range: torch.Tensor | None,
+    rswa_prefix_lens: torch.Tensor | None,
+    rswa_window: int | None,
+    alibi_slopes: torch.Tensor | None,
+    qq_bias: torch.Tensor | None,
+    sinks: torch.Tensor | None,
+    output_scale: torch.Tensor | None,
+    q_descale: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+    kv_quant_mode: KVQuantMode,
+    chunk_lookback: int,
+) -> bool:
+    """Check the complete static contract for the opt-in C1 splitKV launch.
+
+    The scratch tensors are addressed by raw pointer arithmetic in both the
+    producer and reducer.  Contiguous storage is therefore a correctness
+    requirement; PyTorch view strides are not consulted by those kernels.
+    """
+    width = uno_static_query_width
+    if width not in (2, 3, 4, 5):
+        return False
+    if num_seqs != 1 or max_seqlen_q != width:
+        return False
+    if causal is not True or window_size not in ((1023, 0), (-1, -1)):
+        return False
+    if seq_threshold_3D is None or num_par_softmax_segments is None:
+        return False
+    if seq_threshold_3D < width or num_par_softmax_segments != NUM_PAR_SOFTMAX_SEGMENTS:
+        return False
+
+    # Gemma 4's two attention families are the only admitted BF16 layouts.
+    if (
+        q.ndim != 3
+        or k.ndim != 4
+        or v.ndim != 4
+        or out.ndim != 3
+        or q.dtype != torch.bfloat16
+        or k.dtype != torch.bfloat16
+        or v.dtype != torch.bfloat16
+        or out.dtype != torch.bfloat16
+    ):
+        return False
+    head_size = q.shape[2]
+    num_query_heads = q.shape[1]
+    num_kv_heads = k.shape[2]
+    if (head_size, num_kv_heads) not in ((256, 8), (512, 2)):
+        return False
+    if k.shape[-1] != head_size or v.shape[-1] != head_size:
+        return False
+    if num_query_heads != 16 or out.shape[0] != q.shape[0]:
+        return False
+    if out.shape[1] != num_query_heads or out.shape[2] != head_size:
+        return False
+    if q.shape[0] != width or k.device != q.device or v.device != q.device:
+        return False
+    if out.device != q.device:
+        return False
+
+    # These features alter the mask or numeric scale and stay on stock 2-D.
+    if (
+        mm_prefix_range is not None
+        or rswa_prefix_lens is not None
+        or rswa_window is not None
+        or alibi_slopes is not None
+        or qq_bias is not None
+        or sinks is not None
+        or output_scale is not None
+        or q_descale is not None
+        or kv_quant_mode != KVQuantMode.NONE
+        or chunk_lookback >= 0
+    ):
+        return False
+
+    segm_output = softmax_segm_output
+    segm_max = softmax_segm_max
+    segm_expsum = softmax_segm_expsum
+    if segm_output is None or segm_max is None or segm_expsum is None:
+        return False
+    if (
+        segm_output.dtype != torch.float32
+        or segm_max.dtype != torch.float32
+        or segm_expsum.dtype != torch.float32
+        or not segm_output.is_contiguous()
+        or not segm_max.is_contiguous()
+        or not segm_expsum.is_contiguous()
+    ):
+        return False
+    if (
+        segm_output.device != q.device
+        or segm_max.device != q.device
+        or segm_expsum.device != q.device
+    ):
+        return False
+
+    q_rows = q.shape[0]
+    return not (
+        segm_output.ndim != 4
+        or segm_max.ndim != 3
+        or segm_expsum.ndim != 3
+        or segm_output.shape[0] < q_rows
+        or segm_max.shape[0] < q_rows
+        or segm_expsum.shape[0] < q_rows
+        or segm_output.shape[1] != num_query_heads
+        or segm_max.shape[1] != num_query_heads
+        or segm_expsum.shape[1] != num_query_heads
+        or segm_output.shape[2] != num_par_softmax_segments
+        or segm_max.shape[2] != num_par_softmax_segments
+        or segm_expsum.shape[2] != num_par_softmax_segments
+        or segm_output.shape[3] < head_size
+    )
 
 
 @triton.jit
@@ -852,6 +995,8 @@ def unified_attention(
     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window.
     # Default False keeps the original behavior for every other model.
     mm_prefix_clamp_sliding_window: bool = False,
+    # Host-validated physical Uno query width.  None keeps the stock path.
+    uno_static_query_width: int | None = None,
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
@@ -1038,6 +1183,39 @@ def unified_attention(
             f"(out.stride(1) = {out.stride(1)} != head_size = {head_size})."
         )
 
+    uno_splitkv = (
+        uno_static_query_width is not None
+        and _uno_splitkv_env_enabled()
+        and _uno_gemma_splitkv_admissible(
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            max_seqlen_q=max_seqlen_q,
+            num_seqs=num_seqs,
+            causal=causal,
+            window_size=window_size,
+            uno_static_query_width=uno_static_query_width,
+            seq_threshold_3D=seq_threshold_3D,
+            num_par_softmax_segments=num_par_softmax_segments,
+            softmax_segm_output=softmax_segm_output,
+            softmax_segm_max=softmax_segm_max,
+            softmax_segm_expsum=softmax_segm_expsum,
+            mm_prefix_range=mm_prefix_range,
+            rswa_prefix_lens=rswa_prefix_lens,
+            rswa_window=rswa_window,
+            alibi_slopes=alibi_slopes,
+            qq_bias=qq_bias,
+            sinks=sinks,
+            output_scale=output_scale,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            kv_quant_mode=kv_quant_mode,
+            chunk_lookback=chunk_lookback,
+        )
+    )
+
     # Launch the 2D kernel if
     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
     # 2. The batch includes at least one prefill request, or
@@ -1049,10 +1227,24 @@ def unified_attention(
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
+        or (max_seqlen_q > 1 and not uno_splitkv)
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     )
+    if uno_splitkv and use_3d:
+        assert uno_static_query_width is not None
+        # Keep the once-key arguments scalar and hashable: the logger uses an
+        # LRU-backed ``info_once`` implementation, and tensor/dict arguments
+        # would make the engagement receipt fail before the kernel launch.
+        logger.info_once(
+            "UNO_GEMMA_SPLITKV engaged width=%d head_size=%d q_heads=%d "
+            "kv_heads=%d segments=%d",
+            int(uno_static_query_width),
+            int(head_size),
+            int(num_query_heads),
+            int(num_kv_heads),
+            int(num_par_softmax_segments),
+        )
 
     # The kernel signature is the same for 2D and 3D — only the launch
     # grid + a handful of constexpr toggles differ.  Per-token-head scale

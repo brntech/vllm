@@ -1292,6 +1292,18 @@ class VllmConfig:
             or self.cache_config.kv_offloading_size is not None
         ):
             raise ValueError("Uno does not support KV cache transfer")
+        if self.ec_transfer_config is not None:
+            raise ValueError(
+                "Uno does not support EC cache transfer; an EC consumer "
+                "auto-enables multimodal embedding inputs, which Uno's "
+                "text-only draft rows cannot serve"
+            )
+        if self._uno_target_enables_mm_embeds():
+            raise ValueError(
+                "Uno requires a text-only target; --enable-mm-embeds (or the "
+                "EC/KV consumer auto-enablement that implies it) would deliver "
+                "multimodal embeddings to Uno's draft rows"
+            )
         if self.cache_config.kv_sharing_fast_prefill:
             raise ValueError(
                 "Fast prefill optimization for KV sharing is not compatible "
@@ -1312,6 +1324,21 @@ class VllmConfig:
                 "Uno requires max_num_batched_tokens >= max_num_seqs * "
                 f"num_speculative_tokens ({required_tokens}) for draft LoRA routing"
             )
+
+    def _uno_target_enables_mm_embeds(self) -> bool:
+        """Whether embedding inputs survive to a Uno target.
+
+        ``enable_mm_embeds`` is resolved late (a consumer role can set it), so
+        this is read only after the multimodal consumer configuration is final.
+        """
+        model_config = self.model_config
+        if model_config is None:
+            return False
+        mm_config = model_config.multimodal_config
+        return (
+            mm_config is not None
+            and getattr(mm_config, "enable_mm_embeds", False) is True
+        )
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
@@ -1909,9 +1936,13 @@ class VllmConfig:
         # async scheduling).  Uno has no synchronous or V1 fallback, so rerun
         # its narrow contract check after platform-specific updates and fail
         # at initialization with the actionable reason.
+        # The multimodal consumer configuration resolves below, and it can
+        # enable embedding inputs; the Uno guard runs after it so those
+        # predicates are evaluated against the final configuration.
+        self._resolve_mm_embedding_inputs()
+
         self._validate_uno_config()
 
-        self._resolve_mm_embedding_inputs()
         self._resolve_mm_processor_device()
         self._resolve_mm_video_decode_device()
         self._validate_mm_processor_device()
